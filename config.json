@@ -1,6 +1,6 @@
 {
-    "work_interval_minutes": 1,
-    "break_duration_minutes": 1,
+    "work_interval_minutes": 45,
+    "break_duration_minutes": 5,
     "idle_timeout_minutes": 2,
     "meeting_delay_minutes": 10,
     "check_interval_seconds": 1,

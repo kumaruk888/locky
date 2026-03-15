@@ -9,8 +9,14 @@ Features:
 - Double-click to trigger break now
 """
 
+import ctypes
 import tkinter as tk
 from typing import Callable
+
+# Windows constants to hide from taskbar
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TOPMOST = 0x00000008
 
 
 class FloatingWidget:
@@ -39,7 +45,7 @@ class FloatingWidget:
         """Create and show the widget. Must run in its own thread."""
         self.root = tk.Tk()
         self.root.title("BreakGuard")
-        self.root.overrideredirect(True)  # No title bar
+        self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.85)
         self.root.configure(bg="#1a1a2e")
@@ -48,6 +54,28 @@ class FloatingWidget:
         screen_w = self.root.winfo_screenwidth()
         self.root.geometry(f"+{screen_w - 180}+10")
 
+        # Build UI first so window has content
+        self._build_ui()
+
+        # Update once to get proper window size, then hide from taskbar
+        self.root.update_idletasks()
+        self._hide_from_taskbar()
+
+        self._update()
+        self.root.mainloop()
+
+    def _hide_from_taskbar(self):
+        """Use Win32 API to set tool window style — hides from taskbar."""
+        try:
+            hwnd = int(self.root.frame(), 16) if isinstance(self.root.frame(), str) else self.root.frame()
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = style | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        """Build the widget UI."""
         # Main frame
         self.frame = tk.Frame(self.root, bg="#1a1a2e", padx=8, pady=4)
         self.frame.pack()
@@ -88,31 +116,24 @@ class FloatingWidget:
             widget.bind("<Button-1>", self._start_drag)
             widget.bind("<B1-Motion>", self._on_drag)
             widget.bind("<Double-Button-1>", self._on_double_click)
-            widget.bind("<Button-3>", self._toggle_expand)  # Right-click
+            widget.bind("<Button-3>", self._toggle_expand)
 
-        # Rounded border effect
+        # Border
         self.root.configure(highlightbackground="#16c79a", highlightthickness=1)
 
-        self._update()
-        self.root.mainloop()
-
     def _start_drag(self, event):
-        """Start dragging the widget."""
         self._drag_x = event.x
         self._drag_y = event.y
 
     def _on_drag(self, event):
-        """Move the widget as user drags."""
         x = self.root.winfo_x() + (event.x - self._drag_x)
         y = self.root.winfo_y() + (event.y - self._drag_y)
         self.root.geometry(f"+{x}+{y}")
 
     def _on_double_click(self, event):
-        """Double-click to take a break now."""
         self.on_take_break()
 
     def _toggle_expand(self, event):
-        """Right-click to show/hide extra info."""
         self._expanded = not self._expanded
         if self._expanded:
             self.status_label.pack(pady=(2, 0))
@@ -120,7 +141,6 @@ class FloatingWidget:
             self.status_label.pack_forget()
 
     def _update(self):
-        """Update the timer display every second."""
         if self.root is None:
             return
 
@@ -141,10 +161,9 @@ class FloatingWidget:
                 seconds = int(remaining % 60)
                 self.timer_label.config(text=f"{minutes:02d}:{seconds:02d}")
 
-                # Color based on urgency
-                if remaining < 120:  # Less than 2 minutes
+                if remaining < 120:
                     color = "#e94560"
-                elif remaining < 300:  # Less than 5 minutes
+                elif remaining < 300:
                     color = "#ffbd69"
                 else:
                     color = "#16c79a"
@@ -160,12 +179,12 @@ class FloatingWidget:
 
             self.root.after(1000, self._update)
         except tk.TclError:
-            pass  # Widget was destroyed
+            pass
 
     def stop(self):
-        """Close the widget."""
-        if self.root:
-            try:
+        try:
+            if self.root:
+                self.root.quit()
                 self.root.destroy()
-            except tk.TclError:
-                pass
+        except tk.TclError:
+            pass

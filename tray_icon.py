@@ -80,6 +80,7 @@ class TrayIcon:
 
     def _quit(self, icon, item):
         logger.info("Quit requested from tray")
+        self._icon.visible = False
         self._icon.stop()
         self.on_quit()
 

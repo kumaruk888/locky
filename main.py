@@ -8,11 +8,11 @@ break screen, and system tray icon.
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
 
-from break_screen import BreakScreen
 from break_timer import BreakTimer
 from idle_detector import IdleDetector
 from meeting_detector import is_in_meeting
@@ -87,8 +87,13 @@ class BreakGuardApp:
     def quit_app(self):
         logger.info("Shutting down BreakGuard")
         self._running = False
-        if self._widget:
-            self._widget.stop()
+        try:
+            if self._widget:
+                self._widget.stop()
+        except Exception:
+            pass
+        # Force exit to ensure no orphan processes
+        os._exit(0)
 
     # -- Widget helpers --
     def _get_remaining_seconds(self) -> float:
@@ -99,6 +104,18 @@ class BreakGuardApp:
 
     def _is_on_break(self) -> bool:
         return self._in_break
+
+    @staticmethod
+    def _find_python() -> str:
+        """Find the system Python executable when running as a frozen exe."""
+        import shutil
+        # Try pythonw first (no console window), then python
+        for name in ["pythonw", "python"]:
+            path = shutil.which(name)
+            if path:
+                return path
+        # Fallback to known location
+        return r"C:\Users\user\AppData\Local\Programs\Python\Python313\pythonw.exe"
 
     # -- Core loop --
     def _monitor_loop(self):
@@ -128,19 +145,38 @@ class BreakGuardApp:
                 self._trigger_break()
 
     def _trigger_break(self):
-        """Show the break overlay on the main thread."""
+        """Launch break screen as a separate process."""
         self._in_break = True
         logger.info("Break triggered — locking screen")
 
-        screen = BreakScreen(
-            duration_seconds=self.break_duration,
-            exercises=self.exercises,
-            on_break_complete=self._on_break_complete,
-            emergency_password=self.config.get("emergency_password", "exit"),
-        )
-        # BreakScreen uses tkinter which must run on the thread that created it.
-        # We run it in a new thread so the monitor loop isn't blocked.
-        t = threading.Thread(target=screen.show, daemon=True)
+        password = self.config.get("emergency_password", "exit")
+        # When running as exe, look for break_screen.py next to the exe
+        # When running as script, look next to main.py
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        break_script = os.path.join(base_dir, "break_screen.py")
+
+        def run_break():
+            try:
+                # Find Python interpreter — sys.executable is the exe when frozen
+                if getattr(sys, 'frozen', False):
+                    python_exe = self._find_python()
+                else:
+                    python_exe = sys.executable
+
+                logger.info(f"Launching break screen: {python_exe} {break_script}")
+                proc = subprocess.run(
+                    [python_exe, break_script, str(self.break_duration), password],
+                    timeout=self.break_duration + 60,
+                )
+            except Exception as e:
+                logger.error(f"Break screen error: {e}")
+            finally:
+                self._on_break_complete()
+
+        t = threading.Thread(target=run_break, daemon=True)
         t.start()
 
     def _on_break_complete(self):
