@@ -7,6 +7,9 @@ Break types:
 - "Take Break" button or scheduled break: enforced lock for full break
   duration, re-locks if user logs in early, resets work timer after.
 - External lock (Win+L, etc.): pauses work timer, resumes on unlock.
+
+Lock detection uses WTS Session Notifications hooked into the floating
+widget's tkinter window (event-driven, most reliable on Windows 10/11).
 """
 
 import ctypes
@@ -25,27 +28,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("breakguard")
 
-# ---------------------------------------------------------------------------
-# Lock / unlock detection helpers
-# ---------------------------------------------------------------------------
-DESKTOP_SWITCHDESKTOP = 0x0100
-
 
 def lock_workstation():
     """Lock the Windows workstation (same as Win+L)."""
     ctypes.windll.user32.LockWorkStation()
-
-
-def is_workstation_locked() -> bool:
-    """Check if the workstation is currently locked."""
-    hDesktop = ctypes.windll.user32.OpenDesktopW(
-        "Default", 0, False, DESKTOP_SWITCHDESKTOP
-    )
-    if hDesktop:
-        result = ctypes.windll.user32.SwitchDesktop(hDesktop)
-        ctypes.windll.user32.CloseDesktop(hDesktop)
-        return not result
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -132,8 +118,7 @@ class Dashboard:
                 raise ValueError
             break_str = self.break_time_var.get().strip()
             if break_str == "":
-                # Blank break time → 15 seconds (for testing)
-                break_min = 0.25
+                break_min = 0.25  # 15 seconds for testing
             else:
                 break_min = float(break_str)
                 if break_min <= 0:
@@ -155,11 +140,35 @@ class BreakGuardApp:
         self.break_seconds = break_seconds
         self.remaining = screen_seconds
         self._running = True
-        self._in_break = False          # True during enforced break
-        self._externally_locked = False  # True when user locked via Win+L etc.
+        self._in_break = False
+        self._externally_locked = False
+        self._session_locked = False
         self._break_remaining = 0.0
         self._lock = threading.Lock()
 
+    # -- Session event handlers (called from tkinter main thread) --
+    def _on_session_lock(self):
+        """Called when Windows session is locked."""
+        self._session_locked = True
+        logger.info("Session LOCK event received")
+
+        if not self._in_break:
+            self._externally_locked = True
+            logger.info("External lock — work timer paused")
+
+    def _on_session_unlock(self):
+        """Called when Windows session is unlocked."""
+        self._session_locked = False
+        logger.info("Session UNLOCK event received")
+
+        if self._externally_locked and not self._in_break:
+            self._externally_locked = False
+            logger.info(
+                f"External unlock — work timer resumed "
+                f"({self.remaining:.0f}s remaining)"
+            )
+
+    # -- Public state accessors --
     def get_remaining_seconds(self) -> float:
         return max(0, self.remaining)
 
@@ -207,13 +216,13 @@ class BreakGuardApp:
             self._break_remaining -= poll_interval
 
             if self._break_remaining <= 0:
-                # Break time is over
                 logger.info("Break time over — waiting for user to log back in")
-                self._wait_for_login()
+                while self._running and self._session_locked:
+                    time.sleep(1)
                 self._end_enforced_break()
                 break
 
-            if not is_workstation_locked():
+            if not self._session_locked:
                 # User logged in too early — re-lock!
                 logger.info(
                     f"User logged in early — re-locking "
@@ -221,13 +230,6 @@ class BreakGuardApp:
                 )
                 time.sleep(1)
                 lock_workstation()
-
-    def _wait_for_login(self):
-        """Wait until the user actually logs back in."""
-        while self._running:
-            if not is_workstation_locked():
-                return
-            time.sleep(1)
 
     def _end_enforced_break(self):
         """Reset work timer after enforced break ends."""
@@ -238,40 +240,17 @@ class BreakGuardApp:
         logger.info(f"Work timer restarted — {self.screen_seconds:.0f}s")
 
     def timer_loop(self):
-        """Background thread: counts down work timer and detects external locks."""
-        was_locked = False
-
+        """Background thread: counts down the work timer."""
         while self._running:
             time.sleep(1)
 
-            # Don't do anything during enforced breaks
-            if self._in_break:
-                was_locked = False
+            if self._in_break or self._externally_locked:
                 continue
 
-            locked = is_workstation_locked()
+            self.remaining -= 1
 
-            if locked and not was_locked:
-                # User just locked externally (Win+L, etc.)
-                self._externally_locked = True
-                logger.info("External lock detected — pausing work timer")
-
-            if not locked and was_locked and self._externally_locked:
-                # User unlocked after an external lock — resume timer
-                self._externally_locked = False
-                logger.info(
-                    f"External unlock — resuming work timer "
-                    f"({self.remaining:.0f}s remaining)"
-                )
-
-            was_locked = locked
-
-            # Only count down when not locked and not on break
-            if not locked and not self._externally_locked and not self._in_break:
-                self.remaining -= 1
-
-                if self.remaining <= 0:
-                    self._start_enforced_break()
+            if self.remaining <= 0:
+                self._start_enforced_break()
 
     def quit(self):
         logger.info("Shutting down BreakGuard")
@@ -286,9 +265,12 @@ class BreakGuardApp:
             f"break: {self.break_seconds:.0f}s"
         )
 
+        # Start work timer thread
         timer_thread = threading.Thread(target=self.timer_loop, daemon=True)
         timer_thread.start()
 
+        # Start floating widget (blocks on main thread — runs tkinter mainloop)
+        # Session lock/unlock callbacks are hooked into the widget's window
         self.widget = FloatingWidget(
             get_remaining_seconds=self.get_remaining_seconds,
             is_on_break=self.is_on_break,
@@ -296,6 +278,8 @@ class BreakGuardApp:
             get_break_remaining=self.get_break_remaining,
             on_take_break=self.take_break_now,
             on_quit=self.quit,
+            on_session_lock=self._on_session_lock,
+            on_session_unlock=self._on_session_unlock,
         )
         self.widget.show()
 
