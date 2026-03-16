@@ -1,190 +1,160 @@
 """
-Small floating timer widget that sits on the desktop.
-
-Features:
-- Always on top, draggable, semi-transparent
-- Shows countdown to next break as MM:SS
-- Turns red when break is imminent (< 2 min)
-- Click to expand/collapse
-- Double-click to trigger break now
+Floating timer widget — shows countdown to next break with a
+'Take Break Now' button.
 """
 
 import ctypes
 import tkinter as tk
-from typing import Callable
 
-# Windows constants to hide from taskbar
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_TOPMOST = 0x00000008
+WS_EX_APPWINDOW = 0x00040000
 
 
 class FloatingWidget:
-    """A small draggable countdown timer that floats on the desktop."""
+    """Small always-on-top floating timer with Take Break button."""
 
     def __init__(
         self,
-        get_remaining_seconds: Callable[[], float],
-        get_active_minutes: Callable[[], float],
-        is_paused: Callable[[], bool],
-        is_on_break: Callable[[], bool],
-        on_take_break: Callable[[], None],
+        get_remaining_seconds,
+        is_on_break,
+        is_paused,
+        get_break_remaining,
+        on_take_break,
+        on_quit,
     ):
-        self.get_remaining_seconds = get_remaining_seconds
-        self.get_active_minutes = get_active_minutes
-        self.is_paused = is_paused
-        self.is_on_break = is_on_break
-        self.on_take_break = on_take_break
+        self._get_remaining = get_remaining_seconds
+        self._is_on_break = is_on_break
+        self._is_paused = is_paused
+        self._get_break_remaining = get_break_remaining
+        self._on_take_break = on_take_break
+        self._on_quit = on_quit
 
-        self.root = None
+        # Drag state
         self._drag_x = 0
         self._drag_y = 0
-        self._expanded = False
 
     def show(self):
-        """Create and show the widget. Must run in its own thread."""
+        """Build and run the widget. Blocks (tkinter mainloop)."""
         self.root = tk.Tk()
-        self.root.title("BreakGuard")
+        self.root.title("BreakGuard Timer")
         self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.85)
         self.root.configure(bg="#1a1a2e")
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", 0.9)
 
-        # Position at top-right of screen
-        screen_w = self.root.winfo_screenwidth()
-        self.root.geometry(f"+{screen_w - 180}+10")
+        # Position top-right
+        sw = self.root.winfo_screenwidth()
+        self.root.geometry(f"+{sw - 220}+10")
 
-        # Build UI first so window has content
         self._build_ui()
 
-        # Update once to get proper window size, then hide from taskbar
         self.root.update_idletasks()
-        self._hide_from_taskbar()
+
+        # Hide from taskbar
+        hwnd = self.root.winfo_id()
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+        # Dragging
+        for w in [self.root, self.container, self.timer_label, self.status_label]:
+            w.bind("<Button-1>", self._start_drag)
+            w.bind("<B1-Motion>", self._on_drag)
 
         self._update()
         self.root.mainloop()
 
-    def _hide_from_taskbar(self):
-        """Use Win32 API to set tool window style — hides from taskbar."""
-        try:
-            hwnd = int(self.root.frame(), 16) if isinstance(self.root.frame(), str) else self.root.frame()
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style = style | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-        except Exception:
-            pass
-
     def _build_ui(self):
-        """Build the widget UI."""
-        # Main frame
-        self.frame = tk.Frame(self.root, bg="#1a1a2e", padx=8, pady=4)
-        self.frame.pack()
-
-        # Timer row
-        timer_row = tk.Frame(self.frame, bg="#1a1a2e")
-        timer_row.pack()
-
-        self.icon_label = tk.Label(
-            timer_row,
-            text="\u23f1",
-            font=("Segoe UI Emoji", 14),
-            fg="#16c79a",
-            bg="#1a1a2e",
+        # Main container with border
+        self.container = tk.Frame(
+            self.root, bg="#1a1a2e", highlightbackground="#16c79a",
+            highlightthickness=2, padx=10, pady=8,
         )
-        self.icon_label.pack(side="left", padx=(0, 6))
+        self.container.pack(fill="both", expand=True)
 
+        # Timer display
         self.timer_label = tk.Label(
-            timer_row,
-            text="45:00",
-            font=("Consolas", 18, "bold"),
-            fg="#16c79a",
-            bg="#1a1a2e",
+            self.container, text="--:--", font=("Consolas", 22, "bold"),
+            fg="#16c79a", bg="#1a1a2e",
         )
-        self.timer_label.pack(side="left")
+        self.timer_label.pack(pady=(2, 2))
 
-        # Status label (shown when expanded)
+        # Status label
         self.status_label = tk.Label(
-            self.frame,
-            text="",
-            font=("Segoe UI", 9),
-            fg="#8888aa",
-            bg="#1a1a2e",
+            self.container, text="Working...", font=("Segoe UI", 9),
+            fg="#888888", bg="#1a1a2e",
         )
+        self.status_label.pack(pady=(0, 5))
 
-        # Drag bindings
-        for widget in [self.root, self.frame, self.timer_label, self.icon_label]:
-            widget.bind("<Button-1>", self._start_drag)
-            widget.bind("<B1-Motion>", self._on_drag)
-            widget.bind("<Double-Button-1>", self._on_double_click)
-            widget.bind("<Button-3>", self._toggle_expand)
+        # Take Break button
+        self.break_btn = tk.Button(
+            self.container, text="Take Break", font=("Segoe UI", 9, "bold"),
+            fg="#1a1a2e", bg="#e94560", activebackground="#c73850",
+            activeforeground="#1a1a2e", relief="flat", padx=12, pady=2,
+            cursor="hand2", command=self._on_take_break,
+        )
+        self.break_btn.pack(pady=(0, 2))
 
-        # Border
-        self.root.configure(highlightbackground="#16c79a", highlightthickness=1)
 
     def _start_drag(self, event):
         self._drag_x = event.x
         self._drag_y = event.y
 
     def _on_drag(self, event):
-        x = self.root.winfo_x() + (event.x - self._drag_x)
-        y = self.root.winfo_y() + (event.y - self._drag_y)
+        x = self.root.winfo_x() + event.x - self._drag_x
+        y = self.root.winfo_y() + event.y - self._drag_y
         self.root.geometry(f"+{x}+{y}")
 
-    def _on_double_click(self, event):
-        self.on_take_break()
-
-    def _toggle_expand(self, event):
-        self._expanded = not self._expanded
-        if self._expanded:
-            self.status_label.pack(pady=(2, 0))
-        else:
-            self.status_label.pack_forget()
-
     def _update(self):
-        if self.root is None:
-            return
-
         try:
-            if self.is_on_break():
-                self.timer_label.config(text="BREAK", fg="#e94560")
-                self.icon_label.config(text="\U0001f6b6", fg="#e94560")
-                self.root.configure(highlightbackground="#e94560")
-                self.status_label.config(text="Take a walk!")
-            elif self.is_paused():
-                self.timer_label.config(text="PAUSED", fg="#ffbd69")
-                self.icon_label.config(text="\u23f8", fg="#ffbd69")
-                self.root.configure(highlightbackground="#ffbd69")
-                self.status_label.config(text="Timer paused")
-            else:
-                remaining = self.get_remaining_seconds()
-                minutes = int(remaining // 60)
-                seconds = int(remaining % 60)
-                self.timer_label.config(text=f"{minutes:02d}:{seconds:02d}")
-
-                if remaining < 120:
-                    color = "#e94560"
-                elif remaining < 300:
-                    color = "#ffbd69"
+            if self._is_on_break():
+                break_rem = self._get_break_remaining()
+                if break_rem > 0:
+                    mins, secs = divmod(int(break_rem), 60)
+                    self.timer_label.config(
+                        text=f"{mins:02d}:{secs:02d}",
+                        fg="#e94560",
+                    )
+                    self.status_label.config(text="On break — screen locked")
                 else:
-                    color = "#16c79a"
+                    self.timer_label.config(text="Break!", fg="#e94560")
+                    self.status_label.config(text="Waiting for you to return...")
+                self.container.config(highlightbackground="#e94560")
+                self.break_btn.config(state="disabled")
+            elif self._is_paused():
+                remaining = self._get_remaining()
+                mins, secs = divmod(int(remaining), 60)
+                self.timer_label.config(text=f"{mins:02d}:{secs:02d}", fg="#ffbd69")
+                self.status_label.config(text="Paused — screen locked")
+                self.container.config(highlightbackground="#ffbd69")
+                self.break_btn.config(state="disabled")
+            else:
+                remaining = self._get_remaining()
+                mins, secs = divmod(int(remaining), 60)
+                self.timer_label.config(text=f"{mins:02d}:{secs:02d}")
+                self.break_btn.config(state="normal")
+
+                if remaining > 300:
+                    color = "#16c79a"  # Green
+                    self.status_label.config(text="Working...")
+                elif remaining > 120:
+                    color = "#ffbd69"  # Orange
+                    self.status_label.config(text="Break coming soon")
+                else:
+                    color = "#e94560"  # Red
+                    self.status_label.config(text="Break very soon!")
 
                 self.timer_label.config(fg=color)
-                self.icon_label.config(text="\u23f1", fg=color)
-                self.root.configure(highlightbackground=color)
+                self.container.config(highlightbackground=color)
 
-                active = self.get_active_minutes()
-                self.status_label.config(
-                    text=f"Active: {active:.0f} min | Double-click for break"
-                )
-
-            self.root.after(1000, self._update)
-        except tk.TclError:
+        except Exception:
             pass
+
+        self.root.after(500, self._update)
 
     def stop(self):
         try:
-            if self.root:
-                self.root.quit()
-                self.root.destroy()
-        except tk.TclError:
+            self.root.destroy()
+        except Exception:
             pass
